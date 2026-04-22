@@ -31,7 +31,7 @@ from peft import LoraConfig, get_peft_model
 from vllm.lora.request import LoRARequest
 from safetensors.torch import save_file, load_file
 
-from tasks import MathTask, CountdownTask, ZerosTask, RandomTask
+from tasks import MathTask, CountdownTask, ZerosTask, RandomTask, CalibratedMathTask
 
 print("IMPORTS: All imports completed successfully", flush=True)
 print("=" * 80, flush=True)
@@ -58,6 +58,7 @@ class Args:
     pass_at_k: bool = False
     normalize_with_std: bool = False
     scale_lr_in_grad: bool = False
+    per_prompt_normalize: bool = False  # GRPO-style per-prompt z-score of fitness across population
 
     # --- LoRA Config ---
     lora_r: int = 4
@@ -85,6 +86,48 @@ class Args:
     save_freq: int = 50  # None: no saving, -1: saves at last step
     checkpoint_dir: str = None  # If None, will use EXPERIMENT_DIR/run_name/checkpoints
     resume_from: str = None  # Path to checkpoint to resume from
+
+    # --- DCPO-style calibrated-math task options (used when task starts with "calibrated-math:") ---
+    reward_variant: str = "hybrid"      # one of: "hybrid", "instance", "rlcr", "rlcr_hybrid_loo"
+    lambda_cal: float = 0.5             # weight on Brier penalty (Hybrid / RLCR)
+    instance_weight: float = 0.3        # DCPO-I weight (their code hardcodes 0.3)
+    enable_thinking: bool = False       # Qwen3 chat-template flag; DCPO uses False
+    prompt_template: str = "dcpo_verbose"  # one of: "dcpo_verbose", "conf_tags"
+    format_reward_enabled: bool = True  # RLCR-only: +/- bonus on parseable format
+    rho: float = 0.5                    # rlcr_hybrid_loo: T = rho*C + (1-rho)*C_bar_{-i}
+    gamma_fmt: float = 0.05             # rlcr_hybrid_loo: format bonus (valid format)
+    gamma_bad: float = 1.0              # rlcr_hybrid_loo: invalid penalty (truncated/unparseable)
+
+    # --- A1/A2 triage (rlcr_hybrid_loo_retention) ---
+    # Extra coefficients applied only to anchor prompts (base model solves ≥threshold).
+    lambda_retention: float = 0.20        # retention: penalty · (1-C) on anchors
+    lambda_wrong_conf_anchor: float = 0.50 # extra penalty · (1-C)·q² on anchors
+    lambda_trunc: float = 0.25            # per-sample truncation penalty (any prompt, retention variant only)
+    # Anchor set: JSON produced by precompute_anchor_set.py. `anchor_frac` is the
+    # fraction of each training batch to force-fill with anchor prompts.
+    anchor_set_path: str = None
+    anchor_frac: float = 0.0
+    # Global std floor normalization (replaces per-prompt std when the floor is
+    # positive). z_ij = (u_ij - mu_j) / max(sigma_global, global_std_floor),
+    # then clipped to [-fitness_clip, fitness_clip]. Centering remains per-prompt.
+    global_std_floor: float = 0.0         # 0.0 → disabled (keep per-prompt std path)
+    fitness_clip: float = 3.0             # clip range after normalization
+    # Cosine decay on sigma/lr (used by the stability run). decay_final_*
+    # values control the trough at iteration num_iterations-1. Set both to 0
+    # to disable (fixed-value training).
+    cosine_decay_sigma_final: float = 0.0
+    cosine_decay_lr_final: float = 0.0
+
+    # --- In-run DCPO calibration eval (MATH-500 + AIME24) ---
+    # When True, on every `steps_per_eval` step, runs the DCPO-style calibration
+    # eval against the LIVE engine (engine 0) IN ADDITION to the math-eval
+    # accuracy path. Produces ECE/AUROC/Brier/parse_success trajectories so we
+    # can detect reward-hacking and see calibration drift during training.
+    in_run_dcpo_eval: bool = False
+    in_run_dcpo_math500_n: int = 100     # subsample of MATH-500 (first-N); set 0 to skip
+    in_run_dcpo_math500_repeats: int = 2  # samples per MATH-500 problem
+    in_run_dcpo_aime24_repeats: int = 4  # samples per AIME24 problem (30 × this)
+    in_run_dcpo_amc24_repeats: int = 2   # samples per AMC24 problem (45 × this); skipped if data missing
 
     def __post_init__(self):
         if self.lora_alpha is None:
@@ -746,7 +789,7 @@ class ESNcclLLM(LLM):
         
         return adapter_paths
     
-    def generate_and_score(self, prompts, sampling_params, lora_requests, task_obj, answers, args):
+    def generate_and_score(self, prompts, sampling_params, lora_requests, task_obj, answers, args, prompt_is_anchor=None):
         """
         Generates responses AND calculates fitness/stats on the GPU worker.
         """
@@ -781,6 +824,18 @@ class ESNcclLLM(LLM):
         all_task_info = {}  # Collect task-specific info dicts
 
         num_prompts = len(answers)
+        # For rlcr_hybrid_loo: collect per-rollout raw C/q/parsed_ok/boxed_ok/trunc
+        # across the whole population, then call task_obj.finalize_loo_fitness to
+        # overwrite per-member fitnesses with the leave-one-out-group-mean variant.
+        # (See tasks.py:finalize_loo_fitness for contract.)
+        is_loo = getattr(task_obj, "reward_variant", None) in (
+            "rlcr_hybrid_loo", "rlcr_hybrid_loo_retention"
+        )
+        pop_size_here = (len(request_outputs) // num_prompts) if num_prompts else 0
+        per_member_prompt_raw = (
+            [[None for _ in range(num_prompts)] for _ in range(pop_size_here)]
+            if is_loo else None
+        )
 
         # Process linearly.
         pop_responses_buffer = ""
@@ -798,11 +853,18 @@ class ESNcclLLM(LLM):
             # Get fitness
             fit, model_answers, sample_fitnesses, task_info = task_obj.get_fitness(responses, truncateds, gt_answer, pass_at_k=args.pass_at_k)
 
-            # Collect task-specific info
+            # Collect task-specific info (skip underscore-prefixed keys which
+            # carry per-rollout raw data, not scalars — see LOO handling below).
             for k, v in task_info.items():
+                if k.startswith("_"):
+                    continue
                 if k not in all_task_info:
                     all_task_info[k] = []
                 all_task_info[k].append(v)
+
+            # LOO raw-data collection for rlcr_hybrid_loo.
+            if is_loo and "_loo_raw" in task_info:
+                per_member_prompt_raw[pop_idx][prompt_idx] = task_info["_loo_raw"]
 
             # Collect stats
             sample_char_lens = []
@@ -871,6 +933,24 @@ class ESNcclLLM(LLM):
             mean_char_lengths.append(np.mean(sample_char_lens))
             mean_token_lengths.append(np.mean(sample_token_lens))
 
+        # LOO finalize: overwrite fitness_list with cross-population LOO fitnesses.
+        # fitness_list ordering is i = pop_idx * num_prompts + prompt_idx, matching
+        # the enumerate(request_outputs) loop above.
+        loo_info = {}
+        if is_loo and per_member_prompt_raw is not None:
+            try:
+                loo_fitnesses, loo_info = task_obj.finalize_loo_fitness(
+                    per_member_prompt_raw,
+                    prompt_is_anchor=prompt_is_anchor,
+                )
+                fitness_list = [
+                    loo_fitnesses[p][j]
+                    for p in range(pop_size_here)
+                    for j in range(num_prompts)
+                ]
+            except Exception as e:
+                print(f"[WARN] finalize_loo_fitness failed: {e}; falling back to per-member fitness")
+
         info = {
             "total_responses": total_responses,
             "prop_truncated": num_truncated / total_responses if total_responses > 0 else 0.0,
@@ -880,6 +960,7 @@ class ESNcclLLM(LLM):
             "std_in_samples": np.mean(all_sample_stds) if all_sample_stds else 0.0,
             "pass_at_k_fitness": np.mean(all_pass_at_k_fitnesses) if all_pass_at_k_fitnesses else 0.0,
             "mean_sample_fitness": np.mean(all_mean_fitnesses) if all_mean_fitnesses else 0.0,
+            **loo_info,
         }
 
         # Merge task-specific info (average across all samples)
@@ -1142,6 +1223,7 @@ def main(args: Args):
     run_name += f"D{args.sub_dataset_size}-" if args.sub_dataset_size is not None else ""
     run_name += f"std-" if args.normalize_with_std else "no_std-"
     run_name += f"scale_lr-" if args.scale_lr_in_grad else "no_scale_lr-"
+    run_name += f"ppnorm-" if args.per_prompt_normalize else "no_ppnorm-"
     run_name += f"l{args.max_tokens}-"
     run_name += f"n{args.steps_per_adapter}-"
     run_name += f"lr{args.learning_rate}-"
@@ -1246,6 +1328,10 @@ def main(args: Args):
     sys.stdout.flush()
 
     # Task Factory
+    # Tokenizer is needed here because CalibratedMathTask uses the chat template
+    # at prompt-construction time; for other tasks we still re-bind it below.
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
     if args.task == "zeros":
         task = ZerosTask(
             batch_size=args.prompt_batch_size,
@@ -1257,6 +1343,67 @@ def main(args: Args):
             seed=args.base_seed,
             datset_size=args.sub_dataset_size,
             end_token=None
+        )
+    elif args.task.startswith("calibrated-math:"):
+        # IMPORTANT: this branch must appear BEFORE the `math:` branches,
+        # otherwise `args.task.startswith("math:")` will NOT match but the
+        # later `"math:" in args.task` check *will*, leading to an eval_task
+        # misconfiguration. We handle eval_task setup for calibrated-math
+        # explicitly below.
+        dataset_name = args.task.split("calibrated-math:")[1]
+        if args.reward_variant == "hybrid" and args.samples_per_prompt < 2:
+            print(
+                f"[WARN] reward_variant=hybrid with samples_per_prompt={args.samples_per_prompt} "
+                "degenerates to per-sample (group-of-1) reward. Set samples_per_prompt>=2 "
+                "(DCPO uses G=8) for the intended group-level calibration target."
+            )
+        # Optional anchor set for A1/A2 triage.
+        _anchor_indices = None
+        if args.anchor_set_path:
+            import json as _json
+            with open(args.anchor_set_path, "r") as _f:
+                _anchor_payload = _json.load(_f)
+            # Sanity: refuse to run if the anchor file was precomputed against
+            # a different shuffle seed — the indices would point at the wrong
+            # rows in the DeepScaler shuffle and anchor stats would be garbage.
+            _file_seed = int(_anchor_payload.get("shuffle_seed", -1))
+            if _file_seed != int(args.base_seed):
+                raise ValueError(
+                    f"anchor_set_path was built with shuffle_seed={_file_seed} but "
+                    f"training is using base_seed={args.base_seed}; aborting rather "
+                    f"than silently mis-indexing. Re-run precompute_anchor_set.py "
+                    f"with --seed {args.base_seed} or launch training with "
+                    f"--base-seed {_file_seed}."
+                )
+            _anchor_indices = _anchor_payload.get("anchor_indices", [])
+            print(
+                f"[anchor] loaded {len(_anchor_indices)} anchors from "
+                f"{args.anchor_set_path} (frac={args.anchor_frac}, seed={_file_seed})",
+                flush=True,
+            )
+
+        task = CalibratedMathTask(
+            batch_size=args.prompt_batch_size,
+            seed=args.base_seed,
+            tokenizer=tokenizer,
+            dataset_name=dataset_name,
+            datset_size=args.sub_dataset_size,
+            apply_chat_template=True,
+            reward_variant=args.reward_variant,
+            lambda_cal=args.lambda_cal,
+            instance_weight=args.instance_weight,
+            enable_thinking=args.enable_thinking,
+            prompt_template=args.prompt_template,
+            format_reward_enabled=args.format_reward_enabled,
+            rho=args.rho,
+            gamma_fmt=args.gamma_fmt,
+            gamma_bad=args.gamma_bad,
+            lambda_retention=args.lambda_retention,
+            lambda_wrong_conf_anchor=args.lambda_wrong_conf_anchor,
+            lambda_trunc=args.lambda_trunc,
+            anchor_indices=_anchor_indices,
+            anchor_frac=args.anchor_frac,
+            anchor_rng_seed=args.base_seed,
         )
     elif args.task.startswith("math:answer-tags:"):
         dataset_name = args.task.split("math:answer-tags:")[1]
@@ -1295,8 +1442,7 @@ def main(args: Args):
         )
     else:
         raise ValueError(f"Unknown task: {args.task}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
     sampling_params = SamplingParams(
         temperature=args.temperature,
         seed=args.base_seed,
@@ -1305,7 +1451,12 @@ def main(args: Args):
         stop=[tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"],
     )
     do_eval = False
-    if "math:" in args.task and args.steps_per_eval > 0:
+    # Match both "math:..." and "calibrated-math:..." task prefixes for the
+    # in-run accuracy-only eval. Full DCPO metrics (ECE/PCE/AUROC/Brier) are
+    # computed post-training via eval_dcpo_benchmarks.py against the saved
+    # checkpoint; the in-run eval here is just cheap accuracy tracking.
+    is_math_task = args.task.startswith("math:") or args.task.startswith("calibrated-math:")
+    if is_math_task and args.steps_per_eval > 0:
         do_eval = True
         print("--- Configuring Evaluation Tasks ---")
         answer_format = "answer_tags" if "answer-tags" in args.task else "none"
@@ -1323,13 +1474,16 @@ def main(args: Args):
             n=1,
             stop=[tokenizer.eos_token],
         )
+        # For calibrated-math, the in-run eval still uses vanilla MathTask on
+        # math-eval subsets (accuracy only). The calibration metrics come from
+        # the separate post-training eval script.
         eval_task = MathTask(
             batch_size=args.eval_batch_size,
             seed=args.base_seed + 12345,
             # tokenizer=tokenizer,
             dataset_name="math-eval",
             datset_size=None,
-            apply_chat_template=task.apply_chat_template,
+            apply_chat_template=task.apply_chat_template if not args.task.startswith("calibrated-math:") else False,
             answer_format=answer_format
         )
         print(f"Training on {args.task}, evaluating on {eval_task.split_names}.")
@@ -1425,9 +1579,48 @@ def main(args: Args):
     total_time = time.time()
     force_regen_adapters = (start_step > 0)  # Force regeneration on first step if resuming
 
+    # Capture initial sigma/lr once so cosine decay lerps between them and
+    # the configured final values. When both decay_final values are 0.0 the
+    # schedule is a no-op (args.sigma / args.learning_rate stay constant).
+    _initial_sigma = float(args.sigma)
+    _initial_lr = float(args.learning_rate)
+    _decay_enabled = (
+        args.cosine_decay_sigma_final > 0.0 or args.cosine_decay_lr_final > 0.0
+    )
+    if _decay_enabled:
+        print(
+            f"[decay] cosine schedule enabled: sigma {_initial_sigma} → "
+            f"{args.cosine_decay_sigma_final}, lr {_initial_lr} → "
+            f"{args.cosine_decay_lr_final} over {args.num_iterations} iters",
+            flush=True,
+        )
+
     for es_step in range(start_step, args.num_iterations):
         print(f"\n\n======= ES Step {es_step} / {args.num_iterations} =======")
         total_iter_start = time.time()
+
+        # Cosine decay on sigma/lr. Mutating `args` here is safe: the values
+        # are re-broadcast to Ray workers via `ray.put(args)` on every step's
+        # remote call, so worker-side reads of args.sigma / args.learning_rate
+        # see the updated schedule.
+        if _decay_enabled and args.num_iterations > 1:
+            t = es_step / max(args.num_iterations - 1, 1)
+            cos_coef = 0.5 * (1.0 + math.cos(math.pi * t))  # 1.0 → 0.0
+            if args.cosine_decay_sigma_final > 0.0:
+                args.sigma = (
+                    args.cosine_decay_sigma_final
+                    + (_initial_sigma - args.cosine_decay_sigma_final) * cos_coef
+                )
+            if args.cosine_decay_lr_final > 0.0:
+                args.learning_rate = (
+                    args.cosine_decay_lr_final
+                    + (_initial_lr - args.cosine_decay_lr_final) * cos_coef
+                )
+            print(
+                f"[decay] step={es_step} sigma={args.sigma:.6g} "
+                f"lr={args.learning_rate:.6g}",
+                flush=True,
+            )
 
         # --- EVALUATION LOOP (Before training step or periodically) ---
         eval_info_dict_all = {}
@@ -1486,6 +1679,58 @@ def main(args: Args):
             eval_time = time.time() - eval_start
             if args.verbose: print(f"EVAL complete in {eval_time:.4f}s")
 
+        # --- In-run DCPO calibration eval (MATH-500 + AIME24) ------------
+        # Additive to the math-eval accuracy path above. Hits the LIVE engine
+        # 0 (no new process) so we can track ECE/AUROC/Brier/parse_success
+        # trajectories during training — primary signal for reward-hacking.
+        if (
+            args.in_run_dcpo_eval
+            and args.steps_per_eval > 0
+            and es_step % args.steps_per_eval == 0
+        ):
+            print(f"\n--- Running in-run DCPO calibration eval at step {es_step} ---", flush=True)
+            try:
+                from in_run_dcpo_eval import run_in_run_eval
+                dcpo_eval_start = time.time()
+                dcpo_metrics = run_in_run_eval(
+                    llm=engines[0],
+                    tokenizer=tokenizer,
+                    step=es_step,
+                    math500_n=args.in_run_dcpo_math500_n,
+                    math500_repeats=args.in_run_dcpo_math500_repeats,
+                    aime24_repeats=args.in_run_dcpo_aime24_repeats,
+                    amc24_repeats=args.in_run_dcpo_amc24_repeats,
+                    enable_thinking=args.enable_thinking,
+                    prompt_template=args.prompt_template,
+                    out_dir=(os.path.join(args.checkpoint_dir, "in_run_dcpo_eval")
+                             if args.checkpoint_dir else None),
+                )
+                dcpo_eval_time = time.time() - dcpo_eval_start
+                print(f"In-run DCPO eval complete in {dcpo_eval_time:.1f}s: "
+                      f"math500_acc={dcpo_metrics.get('eval/math500_acc', float('nan')):.3f}, "
+                      f"math500_ece={dcpo_metrics.get('eval/math500_ece_verbal', float('nan')):.3f}, "
+                      f"aime24_acc={dcpo_metrics.get('eval/aime24_acc', float('nan')):.3f}, "
+                      f"aime24_ece={dcpo_metrics.get('eval/aime24_ece_verbal', float('nan')):.3f}",
+                      flush=True)
+                # Merge into the wandb payload.
+                eval_info_dict_all.update(dcpo_metrics)
+                # Persist a JSON snapshot alongside the checkpoint dir so the
+                # trajectory survives independently of wandb.
+                try:
+                    if args.checkpoint_dir is not None:
+                        dcpo_json_dir = os.path.join(args.checkpoint_dir, "in_run_dcpo_eval")
+                        os.makedirs(dcpo_json_dir, exist_ok=True)
+                        dcpo_json_path = os.path.join(dcpo_json_dir, f"step_{es_step}.json")
+                        with open(dcpo_json_path, "w") as _f:
+                            json.dump(dcpo_metrics, _f, indent=2, default=str)
+                        print(f"In-run DCPO eval JSON → {dcpo_json_path}", flush=True)
+                except Exception as _json_err:
+                    print(f"WARNING: failed to persist in-run DCPO eval JSON: {_json_err}", flush=True)
+            except Exception as _dcpo_err:
+                print(f"WARNING: in-run DCPO eval failed at step {es_step}: {_dcpo_err}", flush=True)
+                import traceback as _tb
+                _tb.print_exc()
+
         # 1. Generate local LoRA adapters directly on the workers
         should_generate_adapters = (es_step % args.steps_per_adapter == 0) or force_regen_adapters
 
@@ -1519,10 +1764,18 @@ def main(args: Args):
 
         # 2. Evaluate Population
         vllm_start = time.time()
-        prompts, answers = task.get_batch()
-        
+        _batch = task.get_batch()
+        # CalibratedMathTask returns (prompts, answers, is_anchor); plain
+        # MathTask returns (prompts, answers). Handle both.
+        if len(_batch) == 3:
+            prompts, answers, prompt_is_anchor = _batch
+        else:
+            prompts, answers = _batch
+            prompt_is_anchor = None
+
         task_ref = ray.put(task)
         answers_ref = ray.put(answers)
+        prompt_is_anchor_ref = ray.put(prompt_is_anchor) if prompt_is_anchor is not None else None
         all_refs = []
 
         for engine_idx in range(args.num_engines):
@@ -1559,7 +1812,8 @@ def main(args: Args):
                 lora_requests=engine_batch_lora_reqs,
                 task_obj=task_ref,
                 answers=answers_ref,
-                args=args
+                args=args,
+                prompt_is_anchor=prompt_is_anchor_ref,
             )
             all_refs.append(ref)
             
@@ -1589,6 +1843,40 @@ def main(args: Args):
         if args.verbose: print(f"Results aggregation complete in {aggregation_time:.4f}s")
 
         # fitnesses_shaped: Shape (population_size, num_prompts) - already aggregated by pass_at_k logic
+        fitness_std_raw = float(np.std(fitnesses_shaped))
+        # Default: no prompt-difficulty spread metric unless per-prompt norm enabled.
+        per_prompt_mean_range = 0.0
+        # Track the effective std used for normalization (for wandb).
+        effective_global_std = float("nan")
+        if args.per_prompt_normalize:
+            # GRPO-style advantage with GLOBAL std:
+            #   z_ij = (u_ij - mu_j) / (sigma_bar + eps)
+            # where mu_j is per-prompt mean over the population and sigma_bar is a
+            # SINGLE scalar std over all (i, j). This preserves cross-prompt signal
+            # magnitude (unlike per-prompt std, which equalizes every prompt's
+            # contribution and masks reward-signal strength differences).
+            #
+            # A1/A2 triage: when `global_std_floor > 0`, the denominator is
+            # lower-bounded at that value. This prevents the occasional tiny-std
+            # step (whole population near-tied) from blowing up z into the
+            # clipping bounds — which was a plausible source of the stage-1
+            # late-training instability. The post-division fitness is also
+            # clipped to [-fitness_clip, +fitness_clip].
+            pp_mean = np.mean(fitnesses_shaped, axis=0, keepdims=True)  # (1, num_prompts)
+            centered = fitnesses_shaped - pp_mean
+            global_std = float(np.std(fitnesses_shaped))               # scalar over all (i, j)
+            if args.global_std_floor > 0.0:
+                denom = max(global_std, float(args.global_std_floor))
+            else:
+                denom = global_std + 1e-8
+            effective_global_std = denom
+            fitnesses_shaped = centered / denom
+            if args.fitness_clip > 0.0:
+                clip = float(args.fitness_clip)
+                fitnesses_shaped = np.clip(fitnesses_shaped, -clip, clip)
+            per_prompt_mean_range = float(np.max(pp_mean) - np.min(pp_mean))
+        fitness_std_per_prompt_normed = float(np.std(fitnesses_shaped))
+
         fitness_per_prompt = np.mean(fitnesses_shaped, axis=0, keepdims=True)  # Shape: (1, num_prompts)
         fitness_per_pop = np.mean(fitnesses_shaped, axis=1)  # Shape: (population_size,) (for logging)
         normalized_fitnesses = np.mean(fitnesses_shaped - fitness_per_prompt, axis=1) # Shape: (population_size,)
@@ -1685,6 +1973,14 @@ def main(args: Args):
                 "min_fitness": min_fitness,
                 "max_fitness": max_fitness,
                 "std_normalized_fitness": std_normalized_fitness,
+                "fitness_std_raw": fitness_std_raw,
+                "fitness_std_per_prompt_normed": fitness_std_per_prompt_normed,
+                "fitness/std_raw": fitness_std_raw,
+                "fitness/std_after_per_prompt": fitness_std_per_prompt_normed,
+                "fitness/per_prompt_mean_range": per_prompt_mean_range,
+                "fitness/effective_global_std": effective_global_std,
+                "schedule/sigma": float(args.sigma),
+                "schedule/learning_rate": float(args.learning_rate),
                 "std_in_samples": std_in_samples,
                 "pass_at_k_fitness": pass_at_k_fitness,
                 "mean_sample_fitness": mean_sample_fitness,

@@ -5,3 +5,11 @@ core
 des/
 tmp/
 sampling_outputs/
+checkpoints/
+.pytest_cache/
+.venv/
+*.log
+.DS_Store
+data/anchor_set_*.json
+data/MATH-500/
+data/eval_cache/
