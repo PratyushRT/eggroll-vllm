@@ -75,7 +75,10 @@ hard_cleanup() {
     echo "[cleanup] Killing lingering es_lora / ray / vllm processes..."
     pkill -9 -f "es_lora_multinode.py"  2>/dev/null || true
     pkill -9 -f "ray::"                 2>/dev/null || true
-    pkill -9 -f "vllm"                  2>/dev/null || true
+    # Narrow pattern to avoid matching this script's own cmdline (which lives
+    # under /eggroll-vllm/ and would be killed by a bare "vllm" pattern).
+    pkill -9 -f "python.*vllm"          2>/dev/null || true
+    pkill -9 -f "EngineCore_DP"         2>/dev/null || true
     sleep 3
 
     echo "[cleanup] Clearing /dev/shm artifacts..."

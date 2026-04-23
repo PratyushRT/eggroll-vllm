@@ -128,6 +128,8 @@ class Args:
     in_run_dcpo_math500_repeats: int = 2  # samples per MATH-500 problem
     in_run_dcpo_aime24_repeats: int = 4  # samples per AIME24 problem (30 × this)
     in_run_dcpo_amc24_repeats: int = 2   # samples per AMC24 problem (45 × this); skipped if data missing
+    in_run_dcpo_aime25_repeats: int = 0  # samples per AIME25 problem; 0 = skip (HF fallback if no local file)
+    in_run_dcpo_amc23_repeats: int = 0   # samples per AMC23 problem; 0 = skip (HF fallback if no local file)
 
     def __post_init__(self):
         if self.lora_alpha is None:
@@ -1700,6 +1702,8 @@ def main(args: Args):
                     math500_repeats=args.in_run_dcpo_math500_repeats,
                     aime24_repeats=args.in_run_dcpo_aime24_repeats,
                     amc24_repeats=args.in_run_dcpo_amc24_repeats,
+                    aime25_repeats=args.in_run_dcpo_aime25_repeats,
+                    amc23_repeats=args.in_run_dcpo_amc23_repeats,
                     enable_thinking=args.enable_thinking,
                     prompt_template=args.prompt_template,
                     out_dir=(os.path.join(args.checkpoint_dir, "in_run_dcpo_eval")
@@ -1844,6 +1848,10 @@ def main(args: Args):
 
         # fitnesses_shaped: Shape (population_size, num_prompts) - already aggregated by pass_at_k logic
         fitness_std_raw = float(np.std(fitnesses_shaped))
+        # Pre-floor raw sigma of the rewards. Named explicitly for mode-collapse diagnostics:
+        # if global_std_pre_floor -> 0 while floor keeps denom up, the normalized fitness
+        # loses signal and the optimizer stalls (same value as fitness_std_raw, clearer name).
+        global_std_pre_floor = fitness_std_raw
         # Default: no prompt-difficulty spread metric unless per-prompt norm enabled.
         per_prompt_mean_range = 0.0
         # Track the effective std used for normalization (for wandb).
@@ -1879,6 +1887,14 @@ def main(args: Args):
 
         fitness_per_prompt = np.mean(fitnesses_shaped, axis=0, keepdims=True)  # Shape: (1, num_prompts)
         fitness_per_pop = np.mean(fitnesses_shaped, axis=1)  # Shape: (population_size,) (for logging)
+        # Antithetic-pair diagnostic. Ordering convention (see ES update loop):
+        # pop_idx_1 = 2k (+noise), pop_idx_2 = 2k+1 (-noise). Mean absolute pair-diff
+        # tells us how much signal the antithetic trick is actually injecting; near-zero
+        # means +eps and -eps behaved identically (a mode-collapse / no-reward symptom).
+        pos_fit = fitness_per_pop[0::2]
+        neg_fit = fitness_per_pop[1::2]
+        antithetic_pair_diff_mean = float(np.mean(np.abs(pos_fit - neg_fit))) if pos_fit.size else 0.0
+        antithetic_pair_diff_std = float(np.std(pos_fit - neg_fit)) if pos_fit.size else 0.0
         normalized_fitnesses = np.mean(fitnesses_shaped - fitness_per_prompt, axis=1) # Shape: (population_size,)
         normalized_fitnesses_std = np.std(normalized_fitnesses)
         if args.normalize_with_std:
@@ -1979,6 +1995,9 @@ def main(args: Args):
                 "fitness/std_after_per_prompt": fitness_std_per_prompt_normed,
                 "fitness/per_prompt_mean_range": per_prompt_mean_range,
                 "fitness/effective_global_std": effective_global_std,
+                "fitness/global_std_pre_floor": global_std_pre_floor,
+                "fitness/antithetic_pair_diff_mean": antithetic_pair_diff_mean,
+                "fitness/antithetic_pair_diff_std": antithetic_pair_diff_std,
                 "schedule/sigma": float(args.sigma),
                 "schedule/learning_rate": float(args.learning_rate),
                 "std_in_samples": std_in_samples,

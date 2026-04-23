@@ -723,6 +723,36 @@ class CalibratedMathTask(MathTask):
             conf_std = 0.0
             mean_verbal_conf = 0.0
 
+        # Wrong-answer high-confidence diagnostic. Key DCPO/RLCR failure mode:
+        # the model stays high-conf even when wrong. Over non-truncated rollouts,
+        # report (a) mean q on wrong rollouts, (b) fraction of wrong rollouts
+        # with q >= 0.8, and the mirror diagnostics for correct rollouts.
+        wrong_mask = valid_mask & (C_vals < 0.5)
+        right_mask = valid_mask & (C_vals >= 0.5)
+        if wrong_mask.any():
+            q_wrong = q_vals[wrong_mask]
+            wrong_conf_mean = float(q_wrong.mean())
+            wrong_frac_q_ge_0p8 = float((q_wrong >= 0.8).mean())
+        else:
+            wrong_conf_mean = 0.0
+            wrong_frac_q_ge_0p8 = 0.0
+        if right_mask.any():
+            q_right = q_vals[right_mask]
+            correct_conf_mean = float(q_right.mean())
+            correct_frac_q_ge_0p8 = float((q_right >= 0.8).mean())
+        else:
+            correct_conf_mean = 0.0
+            correct_frac_q_ge_0p8 = 0.0
+
+        # 10-bin confidence histogram (over parseable q). Stored as per-bin
+        # rates so WandB line-plots show the distribution migration over steps.
+        hist_rates = np.zeros(10, dtype=np.float64)
+        if parseable_q.size > 0:
+            hist, _ = np.histogram(parseable_q, bins=10, range=(0.0, 1.0))
+            total = float(hist.sum())
+            if total > 0:
+                hist_rates = hist.astype(np.float64) / total
+
         meta = {
             "correct_rate": float(C_vals[valid_mask].mean()) if any_valid else 0.0,
             "mean_q": float(q_vals[valid_mask].mean()) if any_valid else 0.0,
@@ -738,6 +768,22 @@ class CalibratedMathTask(MathTask):
             "mean_verbal_conf": mean_verbal_conf,
             "confidence_std": conf_std,
             "confidence_entropy": conf_entropy,
+            # Wrong-answer-high-conf diagnostics (paper_rlcr primary failure mode):
+            "wrong_conf_mean": wrong_conf_mean,
+            "wrong_frac_q_ge_0p8": wrong_frac_q_ge_0p8,
+            "correct_conf_mean": correct_conf_mean,
+            "correct_frac_q_ge_0p8": correct_frac_q_ge_0p8,
+            # 10-bin confidence histogram rates (bin i covers [i/10, (i+1)/10]).
+            "conf_hist_bin0_rate": float(hist_rates[0]),
+            "conf_hist_bin1_rate": float(hist_rates[1]),
+            "conf_hist_bin2_rate": float(hist_rates[2]),
+            "conf_hist_bin3_rate": float(hist_rates[3]),
+            "conf_hist_bin4_rate": float(hist_rates[4]),
+            "conf_hist_bin5_rate": float(hist_rates[5]),
+            "conf_hist_bin6_rate": float(hist_rates[6]),
+            "conf_hist_bin7_rate": float(hist_rates[7]),
+            "conf_hist_bin8_rate": float(hist_rates[8]),
+            "conf_hist_bin9_rate": float(hist_rates[9]),
         }
         if self.reward_variant == "rlcr" and self.format_reward_enabled:
             meta["format_bonus_mean"] = float(format_bonus[valid_mask].mean()) if any_valid else 0.0

@@ -114,7 +114,12 @@ hard_cleanup() {
     echo "[cleanup] Killing lingering es_lora / ray / vllm processes..."
     pkill -9 -f "es_lora_multinode.py"  2>/dev/null || true
     pkill -9 -f "ray::"                 2>/dev/null || true
-    pkill -9 -f "vllm"                  2>/dev/null || true
+    # Use a narrow pattern so we don't SIGKILL ourselves: this script lives
+    # under /eggroll-vllm/, so the bare literal "vllm" would match our own
+    # cmdline. Targeting "python.*vllm" and vllm's EngineCore subprocess
+    # avoids matching any bash invocation whose path contains "vllm".
+    pkill -9 -f "python.*vllm"          2>/dev/null || true
+    pkill -9 -f "EngineCore_DP"         2>/dev/null || true
     sleep 3
     rm -rf /dev/shm/es_lora_population_async_* /dev/shm/outputs_es_lora 2>/dev/null || true
     if command -v nvidia-smi >/dev/null 2>&1; then

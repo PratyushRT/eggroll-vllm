@@ -234,6 +234,87 @@ def _load_amc24() -> Optional[List[Dict[str, str]]]:
         return None
 
 
+def _load_aime25() -> Optional[List[Dict[str, str]]]:
+    """AIME25: prefer local JSONL/parquet under data/, fall back to HF hub."""
+    local = os.environ.get("IN_RUN_AIME25_PATH")
+    candidates: List[Path] = []
+    if local:
+        candidates.append(Path(local))
+    candidates.extend([
+        _DATA_DIR / "aime25.jsonl",
+        _DATA_DIR / "aime25.parquet",
+    ])
+    for p in candidates:
+        if p.exists():
+            try:
+                if p.suffix == ".parquet":
+                    return _load_parquet(p)
+                return _load_jsonl(p)
+            except Exception as e:
+                warnings.warn(f"in_run_dcpo_eval: failed to load AIME25 from {p}: {e}")
+    # Fallback: HF hub. Try a couple of common mirrors.
+    for repo_id, split in [
+        ("yentinglin/aime_2025", "train"),
+        ("opencompass/AIME2025", "test"),
+        ("math-ai/aime25", "test"),
+    ]:
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(repo_id, split=split)
+            out: List[Dict[str, str]] = []
+            for row in ds:
+                prob = (row.get("problem") or row.get("Problem") or
+                        row.get("question") or row.get("Question") or "")
+                ans = (row.get("answer") or row.get("Answer") or
+                       row.get("solution") or "")
+                out.append({"problem": str(prob), "answer": str(ans)})
+            if out:
+                return out
+        except Exception:
+            continue
+    warnings.warn("in_run_dcpo_eval: AIME25 unavailable locally and HF fallbacks failed; skipping.")
+    return None
+
+
+def _load_amc23() -> Optional[List[Dict[str, str]]]:
+    """AMC23: prefer local parquet/JSONL under data/, fall back to HF hub."""
+    local = os.environ.get("IN_RUN_AMC23_PATH")
+    candidates: List[Path] = []
+    if local:
+        candidates.append(Path(local))
+    candidates.extend([
+        _DATA_DIR / "amc23.parquet",
+        _DATA_DIR / "amc23.jsonl",
+    ])
+    for p in candidates:
+        if p.exists():
+            try:
+                if p.suffix == ".parquet":
+                    return _load_parquet(p)
+                return _load_jsonl(p)
+            except Exception as e:
+                warnings.warn(f"in_run_dcpo_eval: failed to load AMC23 from {p}: {e}")
+    for repo_id, split in [
+        ("math-ai/amc23", "test"),
+        ("AI-MO/aimo-validation-amc", "train"),
+    ]:
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(repo_id, split=split)
+            out: List[Dict[str, str]] = []
+            for row in ds:
+                prob = (row.get("problem") or row.get("Problem") or
+                        row.get("question") or "")
+                ans = (row.get("answer") or row.get("Answer") or "")
+                out.append({"problem": str(prob), "answer": str(ans)})
+            if out:
+                return out
+        except Exception:
+            continue
+    warnings.warn("in_run_dcpo_eval: AMC23 unavailable locally and HF fallbacks failed; skipping.")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction.
 # ---------------------------------------------------------------------------
@@ -329,9 +410,38 @@ def _conf_entropy(parsed_confs: np.ndarray, n_bins: int = _CONF_HIST_BINS) -> fl
 
 
 # ---------------------------------------------------------------------------
-# Pass@k (per-prompt: 1 if any of the k samples is correct, else 0 — matches
-# the simplified formula when k == n samples per prompt).
+# Pass@k.
+#
+# Unbiased estimator (Chen et al. 2021, Codex):
+#     pass@k = 1 - C(n-c, k) / C(n, k)
+# averaged over prompts, where n = samples per prompt, c = correct count.
+# When k > n the estimator is undefined — return NaN. When k == n this
+# degenerates to the "any-correct" version.
 # ---------------------------------------------------------------------------
+def _pass_at_k_unbiased(correct_per_prompt: List[List[int]], k: int) -> float:
+    if not correct_per_prompt:
+        return float("nan")
+    vals: List[float] = []
+    for xs in correct_per_prompt:
+        n = len(xs)
+        if n == 0 or k > n:
+            continue
+        c = int(sum(xs))
+        if n - c < k:
+            vals.append(1.0)
+        else:
+            # 1 - C(n-c, k) / C(n, k) — compute stable via product form.
+            #   C(n-c, k) / C(n, k) = prod_{i=0..k-1} (n-c-i) / (n-i)
+            prob_all_wrong = 1.0
+            for i in range(k):
+                prob_all_wrong *= float(n - c - i) / float(n - i)
+            vals.append(1.0 - prob_all_wrong)
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
+
+
+# Backward-compat wrapper (legacy callers — any-correct pass@k).
 def _pass_at_k(correct_per_prompt: List[List[int]]) -> float:
     if not correct_per_prompt:
         return float("nan")
@@ -416,6 +526,10 @@ def _score_outputs(
         "mce_logits": compute_mce(cl, acc, n_bins=_ECE_BINS),
         "auroc_logits": compute_auroc(cl, acc),
         "pass_at_k": _pass_at_k(per_prompt_correct),
+        # Unbiased pass@k (Chen et al. 2021). pass@1 is the per-sample accuracy;
+        # pass@4 requires >=4 samples per prompt, else NaN.
+        "pass_at_1": _pass_at_k_unbiased(per_prompt_correct, 1),
+        "pass_at_4": _pass_at_k_unbiased(per_prompt_correct, 4),
     }
     return m, raw_samples
 
@@ -426,7 +540,8 @@ def _score_outputs(
 _BENCH_METRIC_KEYS = [
     "acc", "ece_verbal", "pce_verbal", "brier_verbal", "mce_verbal", "auroc_verbal",
     "ece_logits", "pce_logits", "brier_logits", "mce_logits", "auroc_logits",
-    "parse_success", "mean_conf", "conf_entropy", "pass_at_k",
+    "parse_success", "mean_conf", "conf_entropy",
+    "pass_at_k", "pass_at_1", "pass_at_4",
     "n_examples", "n_generations", "gen_seconds",
 ]
 
@@ -457,6 +572,8 @@ def run_in_run_eval(
     step: int,
     aime24_repeats: int = 4,
     amc24_repeats: int = 2,
+    aime25_repeats: int = 0,
+    amc23_repeats: int = 0,
     math500_n: int = 100,
     math500_repeats: int = 2,
     enable_thinking: bool = False,
@@ -496,6 +613,7 @@ def run_in_run_eval(
     raw: Dict[str, Any] = {}
     metrics: Dict[str, Optional[Dict[str, Any]]] = {
         "aime24": None, "amc24": None, "math500": None,
+        "aime25": None, "amc23": None,
     }
 
     # --- AIME24 (always run) ----------------------------------------------
@@ -536,6 +654,46 @@ def run_in_run_eval(
         metrics["amc24"] = amc24_m
         raw["amc24"] = amc24_raw
 
+    # --- AIME25 (optional: aime25_repeats == 0 skips; HF fallback) --------
+    if aime25_repeats and aime25_repeats > 0:
+        aime25_examples = _load_aime25()
+        if aime25_examples is None:
+            warnings.warn("in_run_dcpo_eval: AIME25 unavailable; skipping.")
+        else:
+            aime25_prompts = [
+                _format_chat(tokenizer, ex["problem"] + directive, enable_thinking)
+                for ex in aime25_examples
+            ]
+            sp = _make_sampling_params(aime25_repeats, max_tokens, eos_token, seed)
+            t0 = time.time()
+            aime25_outputs = _generate(llm, aime25_prompts, sp)
+            aime25_dt = time.time() - t0
+            aime25_m, aime25_raw = _score_outputs(aime25_examples, aime25_outputs,
+                                                  prompt_template, regex)
+            aime25_m["gen_seconds"] = round(aime25_dt, 1)
+            metrics["aime25"] = aime25_m
+            raw["aime25"] = aime25_raw
+
+    # --- AMC23 (optional: amc23_repeats == 0 skips; HF fallback) ----------
+    if amc23_repeats and amc23_repeats > 0:
+        amc23_examples = _load_amc23()
+        if amc23_examples is None:
+            warnings.warn("in_run_dcpo_eval: AMC23 unavailable; skipping.")
+        else:
+            amc23_prompts = [
+                _format_chat(tokenizer, ex["problem"] + directive, enable_thinking)
+                for ex in amc23_examples
+            ]
+            sp = _make_sampling_params(amc23_repeats, max_tokens, eos_token, seed)
+            t0 = time.time()
+            amc23_outputs = _generate(llm, amc23_prompts, sp)
+            amc23_dt = time.time() - t0
+            amc23_m, amc23_raw = _score_outputs(amc23_examples, amc23_outputs,
+                                                prompt_template, regex)
+            amc23_m["gen_seconds"] = round(amc23_dt, 1)
+            metrics["amc23"] = amc23_m
+            raw["amc23"] = amc23_raw
+
     # --- MATH-500 (optional: math500_repeats == 0 skips) ------------------
     if math500_repeats and math500_repeats > 0:
         math500_examples = _load_math500(math500_n)
@@ -560,6 +718,10 @@ def run_in_run_eval(
                               "eval/total_seconds": _f(round(total_dt, 1))}
     flat.update(_flatten("aime24", metrics["aime24"]))
     flat.update(_flatten("amc24", metrics["amc24"]))
+    if aime25_repeats and aime25_repeats > 0:
+        flat.update(_flatten("aime25", metrics["aime25"]))
+    if amc23_repeats and amc23_repeats > 0:
+        flat.update(_flatten("amc23", metrics["amc23"]))
     if math500_repeats and math500_repeats > 0:
         flat.update(_flatten("math500", metrics["math500"]))
 
@@ -576,6 +738,7 @@ def run_in_run_eval(
                 "temperature": _DCPO_TEMPERATURE, "top_p": _DCPO_TOP_P,
                 "top_k": _DCPO_TOP_K, "presence_penalty": _DCPO_PRESENCE_PENALTY,
                 "aime24_repeats": aime24_repeats, "amc24_repeats": amc24_repeats,
+                "aime25_repeats": aime25_repeats, "amc23_repeats": amc23_repeats,
                 "math500_repeats": math500_repeats, "math500_n": math500_n,
             },
             "metrics_flat": flat,
